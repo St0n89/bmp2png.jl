@@ -44,6 +44,10 @@ newton_fractal.bmp  1920054 ->    57485 B    3.0%  indexed  800x800 ...
     over the RFC 1951 permuted order.
   * Per block: cheapest of dynamic vs static vs stored (zlib-style).
   * 32768-token blocks.
+* **zlib stream wrapper** — IDAT is a proper RFC 1950 stream: 2-byte CMF/FLG
+  header (CM=8, CINFO=7, FLEVEL mirrors the chosen level, FCHECK `% 31 == 0`)
+  around the raw DEFLATE, plus a big-endian Adler-32 trailer over the
+  UNCOMPRESSED filtered stream.
 
 ## Validation
 
@@ -58,6 +62,10 @@ Everything is verified byte-for-byte against independent implementations
   above (Newton fractal 800×800, insar demo images 900×900).
 * 120 random BMPs (all bit depths, odd sizes, top-down) × levels 1/5/9:
   0 failures.
+* IDAT decoded **strictly**: RFC 1950 header checked (CM, FCHECK, FDICT)
+  and Adler-32 trailer verified via `zlib.decompress` default mode.
+  Raw `-15` mode silently accepts a headerless stream — that exact gap
+  masked the missing wrapper before the 2026-11-13 fix.
 
 ## Compression
 
@@ -94,6 +102,15 @@ python3 test/fuzz.py 40 7                      # 40 random BMPs x 3 levels
 julia test/deflate_fuzz.jl dtest               # raw deflate round-trips
 python3 test/pngcheck.py --check a.bmp a.png   # exact-pixel verify one pair
 ```
+
+## Changelog
+
+* **2026-11-13 — zlib wrapper fix.** IDAT previously contained the raw
+  DEFLATE stream without the RFC 1950 wrapper (zlib header + Adler-32).
+  Lenient readers accepted it; strict decoders (Python `zlib.decompress`
+  default mode, libpng) rejected the PNGs. IDAT is now a proper zlib
+  stream; the DEFLATE payload itself is unchanged. `test/pngcheck.py`
+  now decodes IDAT strictly, guarding against regression.
 
 ## License
 

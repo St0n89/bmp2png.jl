@@ -4,7 +4,12 @@
 Verifies a PNG produced by bmp2png.jl against the source BMP:
   * signature, chunk CRCs, chunk order
   * IHDR fields, PLTE sanity
-  * zlib-decompresses IDAT, unfilters all rows, reconstructs pixels
+  * strictly zlib-decompresses IDAT: RFC 1950 header checked (CM=8,
+    FCHECK % 31 == 0, FDICT clear) and the Adler-32 trailer verified
+    against the decompressed bytes (zlib.decompress default mode, NOT
+    raw -15 mode — raw mode silently accepts a headerless stream and
+    masked exactly that bug in bmp2png.jl before commit 2)
+  * unfilters all rows, reconstructs pixels
   * exact pixel comparison with an independent BMP parse
   * reports size vs zlib level 1/6/9 over the SAME filtered stream
     (isolates encoder quality from filter choice)
@@ -115,7 +120,16 @@ def read_png(path):
     assert ctype in (0, 2, 3, 6), 'color type %d' % ctype
     bpp = {0: 1, 2: 3, 3: 1, 6: 4}[ctype]
     stride = w * bpp
-    data = zlib.decompress(idat, -15)
+    # strict RFC 1950 checks (raw -15 mode would silently accept a
+    # headerless deflate stream — the exact bug this guards against)
+    assert len(idat) >= 6, 'IDAT too short for a zlib stream'
+    cmf, flg = idat[0], idat[1]
+    assert (cmf & 0x0F) == 8, 'bad CM %d (not deflate)' % (cmf & 0x0F)
+    assert ((cmf << 8) | flg) % 31 == 0, 'FCHECK failed (CMF/FLG not divisible by 31)'
+    assert (flg & 0x20) == 0, 'FDICT set (preset dictionary not allowed in PNG)'
+    data = zlib.decompress(idat)  # default mode: requires the zlib header
+    assert zlib.adler32(data) & 0xFFFFFFFF == struct.unpack('>I', idat[-4:])[0], \
+        'Adler-32 trailer mismatch'
     assert len(data) == h * (stride + 1), 'decompressed length %d != %d' % (len(data), h * (stride + 1))
     rows = unfilter(data, stride, h, bpp)
     return dict(w=w, h=h, ctype=ctype, rows=rows, idat=idat, data=data, plte=chunks.get('PLTE'))

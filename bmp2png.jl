@@ -26,6 +26,10 @@
 #         by clamping + Kraft repair, canonical codes, bit-reversed codes.
 #       - Precode (code-length) stream with RLE symbols 16/17/18.
 #       - Per block: dynamic vs static vs stored, cheapest wins (zlib-style).
+#   * IDAT is a proper RFC 1950 zlib stream: 2-byte header (CMF/FLG,
+#     FLEVEL mirrors the chosen level, (CMF<<8|FLG) % 31 == 0) around
+#     the raw DEFLATE, plus a big-endian Adler-32 trailer over the
+#     UNCOMPRESSED filtered stream.
 #
 # Output is verified against an independent Python decoder (see test/).
 # =============================================================================
@@ -54,6 +58,52 @@ function crc32(b::Vector{UInt8}, from::Int = 1, to::Int = length(b))::UInt32
         c = CRC_TABLE[((c ⊻ UInt32(b[i])) & 0xFF) + 1] ⊻ (c >>> 8)
     end
     return c ⊻ 0xFFFFFFFF
+end
+
+# -----------------------------------------------------------------------------
+# Section 1b: Adler-32 (RFC 1950) + zlib stream wrapper
+# -----------------------------------------------------------------------------
+
+# Adler-32 over b. NMAX=5552 is the largest block with 255*n*(n+2)/2 + (n+1)
+# still below 2^32, so a and s can be reduced once per block (zlib's trick).
+function adler32(b::Vector{UInt8})::UInt32
+    a = UInt32(1); s = UInt32(0)
+    i = 1; n = length(b)
+    @inbounds while i ≤ n
+        block = min(n - i + 1, 5552)
+        for _ in 1:block
+            a += UInt32(b[i]); s += a; i += 1
+        end
+        a %= 65521; s %= 65521
+    end
+    return (s << 16) | a
+end
+
+# FLG byte for a zlib (RFC 1950) header at the given deflate level.
+# FLEVEL mirrors zlib's convention: 0 for level 1, 1 for 2-5, 2 for 6,
+# 3 for 7-9. (CMF<<8 | FLG) % 31 == 0 for every returned value.
+function zlib_flg(level::Int)::UInt8
+    level == 1 && return 0x01
+    level ≤ 5 && return 0x5E
+    level == 6 && return 0x9C
+    return 0xDA
+end
+
+# Wrap raw DEFLATE output as a zlib (RFC 1950) stream. The Adler-32
+# trailer is computed over src, the UNCOMPRESSED data (not over raw).
+function zlib_wrap(raw::Vector{UInt8}, src::Vector{UInt8}, level::Int)::Vector{UInt8}
+    out = Vector{UInt8}(undef, length(raw) + 6)
+    out[1] = 0x78                     # CMF: CM=8 (deflate), CINFO=7 (32 KiB window)
+    out[2] = zlib_flg(level)
+    for i in 1:length(raw)
+        out[2 + i] = raw[i]
+    end
+    ad = adler32(src)
+    out[end - 3] = UInt8((ad >>> 24) & 0xFF)   # big-endian, RFC 1950
+    out[end - 2] = UInt8((ad >>> 16) & 0xFF)
+    out[end - 1] = UInt8((ad >>> 8) & 0xFF)
+    out[end]     = UInt8(ad & 0xFF)
+    return out
 end
 
 # -----------------------------------------------------------------------------
@@ -1091,6 +1141,7 @@ function convert_bmp_png(inpath::String, outpath::String, level::Int, ctx::Ctx)
 
     # --- deflate ---
     idat, dst = deflate(fstream, level)
+    idat = zlib_wrap(idat, fstream, level)     # RFC 1950 stream, strict decoders
     t1 = time_ns()
     ctx.nblocks = dst.nblocks
     ctx.ndyn = dst.ndyn
